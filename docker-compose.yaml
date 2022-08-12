@@ -1,0 +1,11 @@
+version: "2.1"
+
+services:
+  pprofweb:
+    build: .
+    restart: unless-stopped
+    volumes:
+      - ".:/profiles:ro"
+    ports:
+      - "8080:8080"
+    command: "-l 0.0.0.0:8080 --profiles /profiles"

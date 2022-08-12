@@ -1,8 +1,8 @@
 package main
 
 import (
+	"errors"
 	"flag"
-	"io"
 	"log"
 	"net/http"
 	"net/http/pprof"
@@ -13,128 +13,117 @@ import (
 
 	"github.com/NYTimes/gziphandler"
 	"github.com/google/pprof/driver"
+	"github.com/google/uuid"
+	"github.com/urfave/cli/v2"
 )
 
-const portEnvVar = "PORT"
-const defaultPort = "8080"
-const maxUploadSize = 32 << 20 // 32 MiB
-
-const fileFormID = "file"
-const uploadPath = "/upload"
 const pprofWebPath = "/pprofweb/"
 
-// use the system-specified temporary directory
-// TODO: do something smarter with a real temporary directory
-var pprofFilePath = filepath.Join(os.TempDir(), "pprofweb-temp")
+func newServer(listenAddr, baseProfilesPath string) *server {
+	return &server{
+		listenAddr:       listenAddr,
+		baseProfilesPath: baseProfilesPath,
+		pprofHandler:     make(map[string]http.Handler),
+	}
+}
 
 type server struct {
-	// serves pprof handlers after it is loaded
-	pprofMux http.Handler
+	listenAddr       string
+	baseProfilesPath string
+	pprofHandler     map[string]http.Handler
+}
+
+func (s *server) Run() error {
+	return http.ListenAndServe(s.listenAddr, s.handler())
 }
 
 func (s *server) startHTTP(args *driver.HTTPServerArgs) error {
+	id := args.Host
+	if _, ok := s.pprofHandler[id]; ok {
+		return nil
+	}
+
 	mux := http.NewServeMux()
 	for pattern, handler := range args.Handlers {
 		var joinedPattern string
 		if pattern == "/" {
-			joinedPattern = pprofWebPath
+			joinedPattern = pprofWebPath + id + "/"
 		} else {
-			joinedPattern = path.Join(pprofWebPath, pattern)
+			joinedPattern = path.Join(pprofWebPath+id+"/", pattern)
 		}
+		log.Println(joinedPattern)
 		mux.Handle(joinedPattern, handler)
 	}
 
 	// enable gzip compression: flamegraphs can be big!
-	s.pprofMux = gziphandler.GzipHandler(mux)
-
+	s.pprofHandler[id] = gziphandler.GzipHandler(mux)
 	return nil
 }
 
 func (s *server) servePprof(w http.ResponseWriter, r *http.Request) {
-	if s.pprofMux == nil {
-		http.Error(w, "must upload profile first", http.StatusInternalServerError)
+	id := strings.TrimPrefix(r.URL.Path, pprofWebPath)
+	if parts := strings.Split(id, "/"); len(parts) > 0 {
+		id = parts[0]
+	}
+
+	if handler, ok := s.pprofHandler[id]; ok {
+		handler.ServeHTTP(w, r)
 		return
 	}
-	s.pprofMux.ServeHTTP(w, r)
+
+	http.Error(w, "profile handler not loaded", http.StatusNotFound)
+	return
 }
 
-func rootHandler(w http.ResponseWriter, r *http.Request) {
+func (s *server) rootHandler(w http.ResponseWriter, r *http.Request) {
 	log.Printf("rootHandler %s %s", r.Method, r.URL.String())
 	if r.Method != http.MethodGet {
 		http.Error(w, "wrong method", http.StatusMethodNotAllowed)
 		return
 	}
+
 	if r.URL.Path != "/" {
 		http.Error(w, "not found", http.StatusNotFound)
 		return
 	}
 
-	w.Write([]byte(rootTemplate))
-}
-
-func (s *server) uploadHandlerErrHandler(w http.ResponseWriter, r *http.Request) {
-	log.Printf("uploadHandler %s %s", r.Method, r.URL.String())
-	if r.Method != http.MethodPost {
-		http.Error(w, "wrong method", http.StatusMethodNotAllowed)
+	profile := r.URL.Query().Get("profile")
+	if profile == "" {
+		w.Write([]byte(rootTemplate))
 		return
 	}
-	err := s.uploadHandler(w, r)
-	if err != nil {
-		log.Printf("upload error: %s", err.Error())
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+	profile = filepath.Clean(profile) // prevent a user entering a path like ../../foo
+	pprofFilePath := filepath.Join(s.baseProfilesPath, profile)
+	if _, err := os.Stat(pprofFilePath); errors.Is(err, os.ErrNotExist) {
+		http.Error(w, "profile not found", http.StatusNotFound)
 		return
 	}
-}
 
-func (s *server) uploadHandler(w http.ResponseWriter, r *http.Request) error {
-	if err := r.ParseMultipartForm(maxUploadSize); err != nil {
-		return err
-	}
-	uploadedFile, _, err := r.FormFile(fileFormID)
-	if err != nil {
-		return err
-	}
-	defer uploadedFile.Close()
-
-	// write the file out to a temporary location
-	f, err := os.OpenFile(pprofFilePath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	if _, err := io.Copy(f, uploadedFile); err != nil {
-		return err
-	}
-	if err := f.Close(); err != nil {
-		return err
-	}
-	if err := uploadedFile.Close(); err != nil {
-		return err
-	}
+	id := uuid.New().String()
 
 	// start the pprof web handler: pass -http and -no_browser so it starts the
 	// handler but does not try to launch a browser
 	// our startHTTP will do the appropriate interception
 	flags := &pprofFlags{
-		args: []string{"-http=localhost:0", "-no_browser", pprofFilePath},
+		args: []string{"-http=" + id + ":0", "-no_browser", pprofFilePath},
 	}
 	options := &driver.Options{
 		Flagset:    flags,
 		HTTPServer: s.startHTTP,
 	}
 	if err := driver.PProf(options); err != nil {
-		return err
+		log.Printf("pprof error: %+v", err)
+		http.Error(w, "pprof error", http.StatusInternalServerError)
+		return
 	}
 
-	http.Redirect(w, r, pprofWebPath, http.StatusSeeOther)
-	return nil
+	http.Redirect(w, r, path.Join(pprofWebPath, id), http.StatusSeeOther)
 }
 
 // handler returns a handler that servers the pprof web UI.
 func (s *server) handler() *http.ServeMux {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/", rootHandler)
-	mux.HandleFunc(uploadPath, s.uploadHandlerErrHandler)
+	mux.HandleFunc("/", s.rootHandler)
 	mux.HandleFunc(pprofWebPath, s.servePprof)
 
 	// copied from net/http/pprof to avoid relying on the global http.DefaultServeMux
@@ -147,18 +136,32 @@ func (s *server) handler() *http.ServeMux {
 }
 
 func main() {
-	s := &server{}
-	handler := s.handler()
+	a := cli.App{
+		Name:        "pprofweb",
+		Description: "",
+		Flags: []cli.Flag{
+			&cli.StringFlag{
+				Name:    "listen",
+				Aliases: []string{"l"},
+				Value:   "0.0.0.0:8080",
+				Usage:   "",
+			},
+			&cli.PathFlag{
+				Name:  "profiles",
+				Value: ".",
+				Usage: "base path containing the profiles",
+			},
+		},
+		Action: func(context *cli.Context) error {
+			listenAddr := context.String("listen")
+			baseProfilesPath := context.String("profiles")
 
-	port := os.Getenv(portEnvVar)
-	if port == "" {
-		port = defaultPort
-		log.Printf("warning: %s not specified; using default %s", portEnvVar, port)
+			s := newServer(listenAddr, baseProfilesPath)
+			log.Printf("listen on addr %s", listenAddr)
+			return s.Run()
+		},
 	}
-
-	addr := ":" + port
-	log.Printf("listen addr %s (http://localhost:%s/)", addr, port)
-	if err := http.ListenAndServe(addr, handler); err != nil {
+	if err := a.Run(os.Args); err != nil {
 		panic(err)
 	}
 }
@@ -168,12 +171,8 @@ const rootTemplate = `<!doctype html>
 <head><title>PProf Web Interface</title></head>
 <body>
 <h1>PProf Web Interface</h1>
-<p>Upload a file to explore it using the <a href="https://github.com/google/pprof">Pprof</a> web interface. See the <a href="https://github.com/evanj/pprofweb">documentation/source code</a>.</p>
-<p>This is currently a hack: it runs in Google Cloud Run, which will restart instances whenever it wants. This means your state may get lost at any time, and it won't work if there are multiple people using it at the same time.</p>
+<p>View a profile by calling <a href="http://localhost:8080?profile=profile_example.pb.gz">localhost:8080?profile=your_profile_file.pb.gz</a></p>
 
-<form method="post" action="` + uploadPath + `" enctype="multipart/form-data">
-<p>Upload file: <input type="file" name="` + fileFormID + `"> <input type="submit" value="Upload"></p>
-</form>
 </body>
 </html>
 `
