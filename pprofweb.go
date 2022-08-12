@@ -52,7 +52,6 @@ func (s *server) startHTTP(args *driver.HTTPServerArgs) error {
 		} else {
 			joinedPattern = path.Join(pprofWebPath+id+"/", pattern)
 		}
-		log.Println(joinedPattern)
 		mux.Handle(joinedPattern, handler)
 	}
 
@@ -100,6 +99,12 @@ func (s *server) rootHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	profile = filepath.Clean(profile) // prevent a user entering a path like ../../foo
 	pprofFilePath := filepath.Join(s.baseProfilesPath, profile)
+	if !strings.HasSuffix(pprofFilePath, ".pb.gz") &&
+		!strings.HasSuffix(pprofFilePath, ".pb.") {
+		http.Error(w, "file extension is not allowed", http.StatusBadRequest)
+		return
+	}
+
 	if _, err := os.Stat(pprofFilePath); errors.Is(err, os.ErrNotExist) {
 		http.Error(w, "profile not found", http.StatusNotFound)
 		return
