@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/http"
 	"net/http/pprof"
+	"net/url"
 	"os"
 	"path"
 	"path/filepath"
@@ -90,6 +91,11 @@ func (s *server) rootHandler(w http.ResponseWriter, r *http.Request) {
 	profile := r.URL.Query().Get("profile")
 	if profile == "" {
 		w.Write([]byte(rootTemplate))
+		return
+	}
+	profile, err := url.QueryUnescape(profile)
+	if err != nil {
+		http.Error(w, "could not url decode query param", http.StatusBadRequest)
 		return
 	}
 	profile = filepath.Clean(profile) // prevent a user entering a path like ../../foo
