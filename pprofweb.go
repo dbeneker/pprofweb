@@ -11,6 +11,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -72,11 +73,14 @@ func (s *server) startHTTP(args *driver.HTTPServerArgs) error {
 	// enable gzip compression: flamegraphs can be big!
 	handler := gziphandler.GzipHandler(mux)
 
-	timer := time.AfterFunc(time.Second*30, func() {
+	timer := time.AfterFunc(s.profileValidDuration, func() {
 		s.pprofHandlerMutex.Lock()
 		defer s.pprofHandlerMutex.Unlock()
 		log.Println("removing", id)
 		delete(s.pprofHandler, id)
+		// the profiles could consume a lot of memory (multiple gb per profile)
+		// so it is better to force the garbage collection to return the freed memory immediately
+		debug.FreeOSMemory()
 	})
 
 	s.pprofHandler[id] = &handlerWithExpire{
@@ -218,7 +222,7 @@ func main() {
 			},
 			&cli.DurationFlag{
 				Name:  "valid",
-				Value: time.Minute * 30,
+				Value: time.Minute * 10,
 				Usage: "The generated profile link will be valid for a specific duration. " +
 					"Is there is no activity within this duration, the profile will be unloaded so the memory could be released.",
 			},
