@@ -3,43 +3,57 @@ package main
 import (
 	"errors"
 	"flag"
+	"fmt"
+	"io"
 	"log"
 	"net/http"
-	"net/http/pprof"
 	"net/url"
 	"os"
 	"path"
 	"path/filepath"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/NYTimes/gziphandler"
 	"github.com/google/pprof/driver"
+	"github.com/google/pprof/profile"
 	"github.com/google/uuid"
 	"github.com/urfave/cli/v2"
 )
 
 const pprofWebPath = "/pprofweb/"
 
-func newServer(listenAddr, baseProfilesPath string) *server {
+func newServer(listenAddr, baseProfilesPath string, profileValidDuration time.Duration) *server {
 	return &server{
-		listenAddr:       listenAddr,
-		baseProfilesPath: baseProfilesPath,
-		pprofHandler:     make(map[string]http.Handler),
+		listenAddr:           listenAddr,
+		baseProfilesPath:     baseProfilesPath,
+		profileValidDuration: profileValidDuration,
+		pprofHandler:         make(map[string]*handlerWithExpire),
 	}
 }
 
 type server struct {
-	listenAddr       string
-	baseProfilesPath string
-	pprofHandler     map[string]http.Handler
+	listenAddr           string
+	baseProfilesPath     string
+	profileValidDuration time.Duration
+	pprofHandler         map[string]*handlerWithExpire
+	pprofHandlerMutex    sync.RWMutex
+}
+
+type handlerWithExpire struct {
+	http.Handler
+	timer *time.Timer
 }
 
 func (s *server) Run() error {
-	return http.ListenAndServe(s.listenAddr, s.handler())
+	return http.ListenAndServe(s.listenAddr, s.logRequest(s.handler()))
 }
 
 func (s *server) startHTTP(args *driver.HTTPServerArgs) error {
 	id := args.Host
+	s.pprofHandlerMutex.Lock()
+	defer s.pprofHandlerMutex.Unlock()
 	if _, ok := s.pprofHandler[id]; ok {
 		return nil
 	}
@@ -56,7 +70,20 @@ func (s *server) startHTTP(args *driver.HTTPServerArgs) error {
 	}
 
 	// enable gzip compression: flamegraphs can be big!
-	s.pprofHandler[id] = gziphandler.GzipHandler(mux)
+	handler := gziphandler.GzipHandler(mux)
+
+	timer := time.AfterFunc(time.Second*30, func() {
+		s.pprofHandlerMutex.Lock()
+		defer s.pprofHandlerMutex.Unlock()
+		log.Println("removing", id)
+		delete(s.pprofHandler, id)
+	})
+
+	s.pprofHandler[id] = &handlerWithExpire{
+		Handler: handler,
+		timer:   timer,
+	}
+
 	return nil
 }
 
@@ -66,13 +93,24 @@ func (s *server) servePprof(w http.ResponseWriter, r *http.Request) {
 		id = parts[0]
 	}
 
+	s.pprofHandlerMutex.RLock()
+	defer s.pprofHandlerMutex.RUnlock()
+
 	if handler, ok := s.pprofHandler[id]; ok {
+		handler.timer.Reset(s.profileValidDuration)
 		handler.ServeHTTP(w, r)
 		return
 	}
 
 	http.Error(w, "profile handler not loaded", http.StatusNotFound)
 	return
+}
+
+func (s *server) logRequest(handler http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		log.Printf("%s %s %s\n", r.RemoteAddr, r.Method, r.URL)
+		handler.ServeHTTP(w, r)
+	})
 }
 
 func (s *server) rootHandler(w http.ResponseWriter, r *http.Request) {
@@ -87,18 +125,18 @@ func (s *server) rootHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	profile := r.URL.Query().Get("profile")
-	if profile == "" {
+	profileQueryParam := r.URL.Query().Get("profile")
+	if profileQueryParam == "" {
 		w.Write([]byte(rootTemplate))
 		return
 	}
-	profile, err := url.QueryUnescape(profile)
+	profileQueryParam, err := url.QueryUnescape(profileQueryParam)
 	if err != nil {
 		http.Error(w, "could not url decode query param", http.StatusBadRequest)
 		return
 	}
-	profile = filepath.Clean(profile) // prevent a user entering a path like ../../foo
-	pprofFilePath := filepath.Join(s.baseProfilesPath, profile)
+	profileQueryParam = filepath.Clean(profileQueryParam) // prevent a user entering a path like ../../foo
+	pprofFilePath := filepath.Join(s.baseProfilesPath, profileQueryParam)
 	if !strings.HasSuffix(pprofFilePath, ".pb.gz") &&
 		!strings.HasSuffix(pprofFilePath, ".pb.") {
 		http.Error(w, "file extension is not allowed", http.StatusBadRequest)
@@ -112,15 +150,32 @@ func (s *server) rootHandler(w http.ResponseWriter, r *http.Request) {
 
 	id := uuid.New().String()
 
+	fetcher := func(src string, duration, timeout time.Duration) (*profile.Profile, string, error) {
+		log.Println("fetching", pprofFilePath)
+		f, err := os.Open(pprofFilePath)
+		if err != nil {
+			return nil, "", err
+		}
+		defer f.Close()
+		p, err := profile.Parse(f)
+		if err != nil {
+			return nil, "", err
+		}
+
+		return p, "", nil
+	}
+
 	// start the pprof web handler: pass -http and -no_browser so it starts the
 	// handler but does not try to launch a browser
 	// our startHTTP will do the appropriate interception
 	flags := &pprofFlags{
-		args: []string{"-http=" + id + ":0", "-no_browser", pprofFilePath},
+		args: []string{"--http=" + id + ":0", "-no_browser", "--symbolize", "none", ""},
 	}
 	options := &driver.Options{
 		Flagset:    flags,
 		HTTPServer: s.startHTTP,
+		UI:         &fakeUI{},
+		Fetch:      fetcherFn(fetcher),
 	}
 	if err := driver.PProf(options); err != nil {
 		log.Printf("pprof error: %+v", err)
@@ -137,12 +192,11 @@ func (s *server) handler() *http.ServeMux {
 	mux.HandleFunc("/", s.rootHandler)
 	mux.HandleFunc(pprofWebPath, s.servePprof)
 
-	// copied from net/http/pprof to avoid relying on the global http.DefaultServeMux
-	mux.HandleFunc("/debug/pprof/", pprof.Index)
-	mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
-	mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
-	mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
-	mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+	// mux.HandleFunc("/debug/pprof/", pprof.Index)
+	// mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+	// mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+	// mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+	// mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
 	return mux
 }
 
@@ -162,12 +216,19 @@ func main() {
 				Value: ".",
 				Usage: "base path containing the profiles",
 			},
+			&cli.DurationFlag{
+				Name:  "valid",
+				Value: time.Minute * 30,
+				Usage: "The generated profile link will be valid for a specific duration. " +
+					"Is there is no activity within this duration, the profile will be unloaded so the memory could be released.",
+			},
 		},
 		Action: func(context *cli.Context) error {
 			listenAddr := context.String("listen")
 			baseProfilesPath := context.String("profiles")
+			profileValidDuration := context.Duration("valid")
 
-			s := newServer(listenAddr, baseProfilesPath)
+			s := newServer(listenAddr, baseProfilesPath, profileValidDuration)
 			log.Printf("listen on addr %s", listenAddr)
 			return s.Run()
 		},
@@ -260,4 +321,35 @@ func (p *pprofFlags) Parse(usage func()) []string {
 		usage()
 	}
 	return args
+}
+
+// fakeUI implements pprof's driver.UI.
+type fakeUI struct{}
+
+func (*fakeUI) ReadLine(prompt string) (string, error) { return "", io.EOF }
+
+func (*fakeUI) Print(args ...interface{}) {
+	msg := fmt.Sprint(args...)
+	log.Println(msg)
+}
+
+func (*fakeUI) PrintErr(args ...interface{}) {
+	msg := fmt.Sprint(args...)
+	log.Println(msg)
+}
+
+func (*fakeUI) IsTerminal() bool {
+	return false
+}
+
+func (*fakeUI) WantBrowser() bool {
+	return false
+}
+
+func (*fakeUI) SetAutoComplete(complete func(string) string) {}
+
+type fetcherFn func(_ string, _, _ time.Duration) (*profile.Profile, string, error)
+
+func (f fetcherFn) Fetch(s string, d, t time.Duration) (*profile.Profile, string, error) {
+	return f(s, d, t)
 }
